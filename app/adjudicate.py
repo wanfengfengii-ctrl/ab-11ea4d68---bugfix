@@ -272,6 +272,7 @@ class _Engine:
             pr = {"rule": "POLICIES", "result": pol["result"]}
             if pol.get("valid_policies") is not None:
                 pr["valid_policies"] = pol["valid_policies"]
+            pr["policy_trace"] = pol.get("policy_trace", [])
             path_rules.append(pr)
             decision["path"] = path
             decision["per_certificate"] = explorer.trace_path(path)

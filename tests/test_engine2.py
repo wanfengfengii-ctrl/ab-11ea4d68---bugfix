@@ -186,6 +186,147 @@ def test_require_explicit_policy():
     assert "POLICY" in ",".join(res2["summary"]["failure_codes"])
 
 
+def test_policy_two_level_continuous_mapping():
+    """P1 ->(CA1)-> P2 ->(CA2)-> P3 must compose: leaf P3 satisfies [P1]."""
+    P1, P2, P3 = ("1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.2",
+                  "1.3.6.1.4.1.99999.3")
+    bag = Bag()
+    root = make_ca("Root", "rsa", not_before=T("2020-01-01"), not_after=T("2040-01-01"))
+    ca1 = make_ca("CA1", "ec", issuer=root, not_before=T("2021-01-01"),
+                  not_after=T("2035-01-01"), policies=[P1],
+                  policy_mappings=[(P1, P2)])
+    ca2 = make_ca("CA2", "ec", issuer=ca1, not_before=T("2021-06-01"),
+                  not_after=T("2034-01-01"), policies=[P2],
+                  policy_mappings=[(P2, P3)])
+    leaf = make_leaf(ca2, "Leaf", "ed", not_before=T("2022-01-01"),
+                     not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.3"],
+                     policies=[P3])
+    for e in (root, ca1, ca2, leaf):
+        bag.cert(e)
+    for issuer in (root, ca1, ca2):
+        bag.add(make_crl(issuer, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                         next_update=T("2024-07-01")), "crl", EARLY)
+    res = adjudicate(bag, sha256_hex(leaf.der), [sha256_hex(root.der)],
+                     leaf_key=leaf.key, initial_policy_set=[P1])
+    assert res["verdict"] == "VALID", dumps(res["decision"]).decode()
+    pol = [r for r in res["decision"]["path_rules"] if r["rule"] == "POLICIES"][0]
+    assert pol["result"] == "pass"
+    assert pol["valid_policies"] == [P3]
+    trace = pol["policy_trace"]
+    assert [layer["certificate"] for layer in trace] == [
+        sha256_hex(ca1.der), sha256_hex(ca2.der), sha256_hex(leaf.der)]
+    assert trace[0]["valid_policies"] == [P1]
+    assert trace[1]["valid_policies"] == [P2]
+    assert trace[2]["valid_policies"] == [P3]
+    # an unrelated initial policy still fails
+    res2 = adjudicate(bag, sha256_hex(leaf.der), [sha256_hex(root.der)],
+                      leaf_key=leaf.key,
+                      initial_policy_set=["1.3.6.1.4.1.99999.9"])
+    assert res2["verdict"] == "INVALID"
+    assert "POLICY_INITIAL_SET_MISMATCH" in res2["summary"]["failure_codes"]
+
+
+def _mapping_chain(policy_constraints_ca1=None):
+    P1, P2, P3 = ("1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.2",
+                  "1.3.6.1.4.1.99999.3")
+    bag = Bag()
+    root = make_ca("Root", "rsa", not_before=T("2020-01-01"), not_after=T("2040-01-01"))
+    ca1 = make_ca("CA1", "ec", issuer=root, not_before=T("2021-01-01"),
+                  not_after=T("2035-01-01"), policies=[P1],
+                  policy_mappings=[(P1, P2)],
+                  policy_constraints=policy_constraints_ca1)
+    ca2 = make_ca("CA2", "ec", issuer=ca1, not_before=T("2021-06-01"),
+                  not_after=T("2034-01-01"), policies=[P2],
+                  policy_mappings=[(P2, P3)])
+    leaf = make_leaf(ca2, "Leaf", "ed", not_before=T("2022-01-01"),
+                     not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.3"],
+                     policies=[P3])
+    for e in (root, ca1, ca2, leaf):
+        bag.cert(e)
+    for issuer in (root, ca1, ca2):
+        bag.add(make_crl(issuer, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                         next_update=T("2024-07-01")), "crl", EARLY)
+    return bag, root, leaf
+
+
+def test_policy_mapping_inhibit_count_boundaries():
+    # inhibitPolicyMapping=1 exempts exactly CA2; the leaf-layer mapping is
+    # inhibited, so P3 cannot chain back to P1
+    bag, root, leaf = _mapping_chain({"inhibit_mapping": 1})
+    res = adjudicate(bag, sha256_hex(leaf.der), [sha256_hex(root.der)],
+                     leaf_key=leaf.key,
+                     initial_policy_set=["1.3.6.1.4.1.99999.1"])
+    assert res["verdict"] == "INVALID"
+    assert "POLICY_INITIAL_SET_MISMATCH" in res["summary"]["failure_codes"]
+    # inhibitPolicyMapping=2 exempts both intermediates: chain stays valid
+    bag2, root2, leaf2 = _mapping_chain({"inhibit_mapping": 2})
+    res2 = adjudicate(bag2, sha256_hex(leaf2.der), [sha256_hex(root2.der)],
+                      leaf_key=leaf2.key,
+                      initial_policy_set=["1.3.6.1.4.1.99999.1"])
+    assert res2["verdict"] == "VALID", dumps(res2["decision"]).decode()
+    pol = [r for r in res2["decision"]["path_rules"] if r["rule"] == "POLICIES"][0]
+    assert pol["valid_policies"] == ["1.3.6.1.4.1.99999.3"]
+
+
+def test_require_explicit_policy_skip_boundary():
+    ANY = "2.5.29.32.0"
+    # requireExplicitPolicy=1 with one intermediate exempts the leaf: the
+    # leaf's anyPolicy-only tree is accepted
+    bag = Bag()
+    root = make_ca("Root", "rsa", not_before=T("2020-01-01"), not_after=T("2040-01-01"))
+    inter = make_ca("Inter", "ec", issuer=root, not_before=T("2021-01-01"),
+                    not_after=T("2035-01-01"), policies=[ANY],
+                    policy_constraints={"require_explicit": 1})
+    leaf = make_leaf(inter, "Leaf", "ed", not_before=T("2022-01-01"),
+                     not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.3"],
+                     policies=[ANY])
+    for e in (root, inter, leaf):
+        bag.cert(e)
+    bag.add(make_crl(inter, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                     next_update=T("2024-07-01")), "crl", EARLY)
+    bag.add(make_crl(root, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                     next_update=T("2024-07-01")), "crl", EARLY)
+    res = adjudicate(bag, sha256_hex(leaf.der), [sha256_hex(root.der)],
+                     leaf_key=leaf.key)
+    assert res["verdict"] == "VALID", dumps(res["decision"]).decode()
+    # value 0 over the same leaf enforces explicit policy -> anyPolicy fails
+    bag2 = Bag()
+    root2 = make_ca("Root", "rsa", not_before=T("2020-01-01"), not_after=T("2040-01-01"))
+    inter2 = make_ca("Inter", "ec", issuer=root2, not_before=T("2021-01-01"),
+                     not_after=T("2035-01-01"), policies=[ANY],
+                     policy_constraints={"require_explicit": 0})
+    leaf2 = make_leaf(inter2, "Leaf", "ed", not_before=T("2022-01-01"),
+                      not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.3"],
+                      policies=[ANY])
+    for e in (root2, inter2, leaf2):
+        bag2.cert(e)
+    bag2.add(make_crl(inter2, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                      next_update=T("2024-07-01")), "crl", EARLY)
+    bag2.add(make_crl(root2, entries=[], crl_number=1, this_update=T("2024-05-01"),
+                      next_update=T("2024-07-01")), "crl", EARLY)
+    res2 = adjudicate(bag2, sha256_hex(leaf2.der), [sha256_hex(root2.der)],
+                      leaf_key=leaf2.key)
+    assert res2["verdict"] == "INVALID"
+    assert "POLICY_EXPLICIT_REQUIRED" in res2["summary"]["failure_codes"]
+
+
+def test_rejection_proof_policy_trace():
+    """A policy failure in the rejection proof carries the per-layer trace."""
+    P1, P2, P3 = ("1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.2",
+                  "1.3.6.1.4.1.99999.3")
+    bag, root, leaf = _mapping_chain()
+    res = adjudicate(bag, sha256_hex(leaf.der), [sha256_hex(root.der)],
+                     leaf_key=leaf.key,
+                     initial_policy_set=["1.3.6.1.4.1.99999.9"])
+    assert res["verdict"] == "INVALID"
+    proof = res["decision"]["rejection_proof"]
+    pf = next(b["failure"] for b in proof["branches"]
+              if b["failure"]["rule"] == "POLICIES")
+    trace = pf["details"]["policy_trace"]
+    assert len(trace) == 3
+    assert trace[2]["valid_policies"] == [P3]
+
+
 def test_cross_signed_different_keys_aki_selects_parent():
     """Same subject name, different keys: AKI/SKI pins the right parent."""
     bag = Bag()

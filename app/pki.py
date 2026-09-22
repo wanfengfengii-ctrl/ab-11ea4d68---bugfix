@@ -426,25 +426,46 @@ def check_name_constraints(path: list) -> dict:
 def evaluate_policies(path: list, initial_policy_set: list) -> dict:
     """Evaluate certificate policies for a candidate path (leaf-first order).
 
-    Returns a rule result dict; on success includes ``valid_policies``.
+    Returns a rule result dict; on success includes ``valid_policies`` and a
+    per-layer ``policy_trace`` (ordered from the certificate below the anchor
+    down to the leaf) recording, for every certificate:
 
-    Profile semantics (documented in README):
+      * ``certificate_policies`` - the asserted policies (``null`` when the
+        certificatePolicies extension is absent);
+      * ``mappings`` - the issuer's policyMappings applied at that layer;
+      * ``mappings_inhibited`` / ``any_policy_inhibited`` /
+        ``explicit_policy_required`` - the effective controls at that
+        certificate, derived from skip counters;
+      * ``valid_policies`` - the surviving policy set expressed in *that
+        certificate's own terms* (``[]`` is the NULL valid policy tree).
+
+    The trace is a deterministic function of the path and is what the offline
+    evidence-pack verifier independently recomputes.
+
+    Semantics (RFC 5280 section 6.1, profile subset documented in README):
       * The trust anchor is treated as ``anyPolicy``; its own extensions are
         not processed.
-      * ``valid_policy_set`` starts as {anyPolicy} at the anchor and is
-        narrowed certificate by certificate down to the leaf.  A certificate
-        without certificatePolicies collapses the set to NULL (sticky).
-      * policyMappings of the issuer rewrite child policies, unless inhibited.
-      * anyPolicy in a certificate keeps the set open, unless inhibited.
+      * The valid policy set is maintained in each certificate's *own* terms.
+        A mapping P_issuer <- P_subject lets a child policy satisfy the
+        issuer-domain policy, and mappings compose continuously across any
+        number of CAs: an issuer-domain policy at one layer (e.g. P2) that is
+        itself a subject-domain policy at the next layer keeps chaining.
+      * A certificate without certificatePolicies prunes the tree to NULL
+        (sticky).
+      * ``anyPolicy`` keeps the set open unless inhibited by
+        inhibitAnyPolicy.
       * Skip-count semantics (RFC 5280 4.2.1.11 / 4.2.1.14): a constraint
         value ``k`` on the certificate at position ``p`` exempts the ``k``
         certificates immediately below it and takes effect at the
         ``(k+1)``-th certificate below; multiple constraints combine with
         MIN.  Trust-anchor extensions are ignored.
-      * Final acceptance: the valid set must satisfy requireExplicitPolicy
-        (if effective at the leaf) and intersect the initial policy set
-        (an initial set of [anyPolicy] accepts anything the tree asserts,
-        including a NULL tree when explicit policy is not required).
+      * A policyMapping to or from anyPolicy is prohibited on every path,
+        independent of inhibitPolicyMapping.
+      * Final acceptance (user-initial-policy set phase, RFC 6.1.5): the
+        initial set is composed through the whole chain of mappings, and the
+        surviving set must intersect it.  An initial set of [anyPolicy]
+        accepts anything the tree asserts, including a NULL tree when
+        explicit policy is not required.
     """
     n = len(path) - 1  # anchor index
 
@@ -465,100 +486,160 @@ def evaluate_policies(path: list, initial_policy_set: list) -> dict:
             best = v if best is None else min(best, v)
         return best
 
-    valid = {ANY_POLICY}  # None represents the NULL valid_policy_tree
+    def fail(code: str, cert_idx: int, detail: str, trace: list) -> dict:
+        return {
+            "result": "fail",
+            "code": code,
+            "certificate": path[cert_idx].fingerprint,
+            "detail": detail,
+            "policy_trace": trace,
+        }
+
+    trace: list = []
+    layers: list = []  # processing order: certificate below the anchor -> leaf
+    valid = {ANY_POLICY}  # own-terms set at the current cert; None = NULL tree
     for idx in range(n - 1, -1, -1):
         cert = path[idx]
-        mapping_allowed = (pending_at("inhibit_mapping", idx) or 1) > 0
-        any_allowed = (pending_at("inhibit_any", idx) or 1) > 0
+        mapping_counter = pending_at("inhibit_mapping", idx)
+        any_counter = pending_at("inhibit_any", idx)
+        explicit_counter = pending_at("require_explicit", idx)
+        # Skip-count boundary (RFC 5280 4.2.1.11/14, README): a counter value
+        # k exempts exactly the k certificates immediately below; the control
+        # takes effect when the counter has run below zero (at the (k+1)-th
+        # certificate below).  A value of exactly zero still exempts that
+        # last certificate.
+        mapping_inhibited = mapping_counter is not None and mapping_counter < 0
+        any_inhibited = any_counter is not None and any_counter < 0
+        explicit_required = explicit_counter is not None and explicit_counter < 0
 
-        parent_mappings = []
-        if idx + 1 <= n - 1:
-            parent_mappings = path[idx + 1].policy_mappings
-        mapped_issuer_policies = {}
-        if mapping_allowed:
+        parent_mappings = tuple(path[idx + 1].policy_mappings) if idx + 1 <= n - 1 else ()
+        # anyPolicy may never appear in a policy mapping, whether or not
+        # mapping is otherwise inhibited (RFC 5280 4.2.1.5)
+        for (ip, sp) in parent_mappings:
+            if ip == ANY_POLICY_OID or sp == ANY_POLICY_OID:
+                return fail(
+                    "POLICY_MAPPING_ANY", idx + 1,
+                    f"policyMappings with anyPolicy at {path[idx + 1].fingerprint}",
+                    trace,
+                )
+
+        map_subject_to_issuers: dict = {}
+        if not mapping_inhibited:
             for (ip, sp) in parent_mappings:
-                if ip == ANY_POLICY_OID or sp == ANY_POLICY_OID:
-                    return {
-                        "result": "fail",
-                        "code": "POLICY_MAPPING_ANY",
-                        "certificate": path[idx + 1].fingerprint,
-                        "detail": f"policyMappings with anyPolicy at {path[idx+1].fingerprint}",
-                    }
-                mapped_issuer_policies.setdefault(sp, []).append(ip)
+                map_subject_to_issuers.setdefault(sp, []).append(ip)
 
-        if valid is None:
-            continue  # NULL tree is sticky; counters are position-based
-        cert_policies = cert.policies
-        if cert_policies is None:
+        if cert.policies is None:
             valid = None
-            continue
-        oids = list(cert_policies)
-        has_any = ANY_POLICY_OID in oids
-        oids = [p for p in oids if p != ANY_POLICY_OID]
-        if ANY_POLICY in valid:
-            # open set: narrow to the cert's policies (with mappings)
+        elif valid is not None:
+            cert_policies = list(cert.policies)
+            has_any = ANY_POLICY_OID in cert_policies
+            explicit_oids = [p for p in cert_policies if p != ANY_POLICY_OID]
             new_valid = set()
-            if has_any and any_allowed:
-                new_valid.add(ANY_POLICY)
-            for p in oids:
-                new_valid.add(p)
-                for ip in mapped_issuer_policies.get(p, []):
-                    new_valid.add(ip)
-            valid = new_valid if new_valid else None
-        else:
-            new_valid = set()
-            if has_any and any_allowed:
-                new_valid |= valid
-            for p in oids:
-                if p in valid:
-                    new_valid.add(p)
-                for ip in mapped_issuer_policies.get(p, []):
-                    if ip in valid:
-                        new_valid.add(ip)
+            if ANY_POLICY in valid:
+                # an anyPolicy parent node matches every asserted policy
+                if has_any and not any_inhibited:
+                    new_valid.add(ANY_POLICY)
+                new_valid.update(explicit_oids)
+            else:
+                # this certificate's anyPolicy stands in (as one node
+                # labeled anyPolicy) for every parent policy node
+                if has_any and not any_inhibited:
+                    new_valid.add(ANY_POLICY)
+                for p in explicit_oids:
+                    # direct match or a link through an uninhibited mapping
+                    if (p in valid
+                            or any(ip in valid for ip in map_subject_to_issuers.get(p, ()))):
+                        new_valid.add(p)
             valid = new_valid if new_valid else None
 
-    explicit_required = (pending_at("require_explicit", 0) or 1) <= 0
+        asserted = None if cert.policies is None else sorted(
+            ANY_POLICY if p == ANY_POLICY_OID else p for p in cert.policies
+        )
+        layers.append({
+            "valid": valid,
+            "map_s2i": map_subject_to_issuers,
+        })
+        trace.append({
+            "certificate": cert.fingerprint,
+            "certificate_policies": asserted,
+            "mappings": sorted(
+                ({"issuer_domain_policy": ip, "subject_domain_policy": sp}
+                 for (ip, sp) in parent_mappings),
+                key=lambda m: (m["issuer_domain_policy"], m["subject_domain_policy"]),
+            ),
+            "mappings_inhibited": mapping_inhibited,
+            "any_policy_inhibited": any_inhibited,
+            "explicit_policy_required": explicit_required,
+            "valid_policies": [] if valid is None else sorted(valid),
+        })
+
+    explicit_at_leaf = (
+        (v := pending_at("require_explicit", 0)) is not None and v < 0
+    )
     initial = list(initial_policy_set) if initial_policy_set else [ANY_POLICY]
     initial_specific = ANY_POLICY not in initial and ANY_POLICY_OID not in initial
+    initial_set = set(initial)
 
     if valid is None:
-        if explicit_required:
-            return {
-                "result": "fail",
-                "code": "POLICY_TREE_EMPTY",
-                "certificate": path[0].fingerprint,
-                "detail": "explicit policy required but the valid policy tree is null",
-            }
+        if explicit_at_leaf:
+            return fail(
+                "POLICY_TREE_EMPTY", 0,
+                "explicit policy required but the valid policy tree is null",
+                trace,
+            )
         if initial_specific:
-            return {
-                "result": "fail",
-                "code": "POLICY_INITIAL_SET_MISMATCH",
-                "certificate": path[0].fingerprint,
-                "detail": "no policies are asserted but the initial policy set is specific",
-            }
-        return {"result": "pass", "valid_policies": []}
+            return fail(
+                "POLICY_INITIAL_SET_MISMATCH", 0,
+                "no policies are asserted but the initial policy set is specific",
+                trace,
+            )
+        return {"result": "pass", "valid_policies": [], "policy_trace": trace}
     if valid == {ANY_POLICY}:
-        if explicit_required:
-            return {
-                "result": "fail",
-                "code": "POLICY_EXPLICIT_REQUIRED",
-                "certificate": path[0].fingerprint,
-                "detail": "explicit policy required but only anyPolicy remains",
-            }
+        if explicit_at_leaf:
+            return fail(
+                "POLICY_EXPLICIT_REQUIRED", 0,
+                "explicit policy required but only anyPolicy remains",
+                trace,
+            )
         return {
             "result": "pass",
             "valid_policies": sorted(initial) if initial_specific else [ANY_POLICY],
+            "policy_trace": trace,
         }
+
+    # User-initial-policy-set phase (RFC 5280 6.1.5(g)): descend the initial
+    # policies through the *full* chain of mappings and anyPolicy stand-in
+    # nodes, keeping the set at each layer in that certificate's own terms.
     if initial_specific:
-        if ANY_POLICY in valid:
-            return {"result": "pass", "valid_policies": sorted(initial)}
-        inter = valid & set(initial)
-        if not inter:
-            return {
-                "result": "fail",
-                "code": "POLICY_INITIAL_SET_MISMATCH",
-                "certificate": path[0].fingerprint,
-                "detail": f"valid policies {sorted(valid)} do not intersect initial policy set",
-            }
-        return {"result": "pass", "valid_policies": sorted(inter)}
-    return {"result": "pass", "valid_policies": sorted(valid)}
+        current = set(initial_set)
+        for layer in layers:
+            layer_valid = layer["valid"]
+            map_s2i = layer["map_s2i"]
+            nxt = set()
+            for p in current:
+                if p == ANY_POLICY:
+                    # Under this engine's tree rules every surviving node at
+                    # the layer below an anyPolicy node was created as one of
+                    # its children, so the wildcard expands to all of them.
+                    nxt.update(layer_valid)
+                elif p in layer_valid:
+                    nxt.add(p)
+                elif ANY_POLICY in layer_valid:
+                    # a surviving anyPolicy node wildcard-matches any policy;
+                    # continue the descent on the wildcard node itself
+                    nxt.add(ANY_POLICY)
+                for sp, ips in map_s2i.items():
+                    if p in ips:
+                        nxt.add(sp)
+            current = nxt & layer_valid if layer_valid is not None else set()
+            if not current:
+                break
+        if not current:
+            return fail(
+                "POLICY_INITIAL_SET_MISMATCH", 0,
+                f"valid policies {sorted(valid)} do not intersect initial policy set",
+                trace,
+            )
+        return {"result": "pass", "valid_policies": sorted(current),
+                "policy_trace": trace}
+    return {"result": "pass", "valid_policies": sorted(valid), "policy_trace": trace}

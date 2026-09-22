@@ -121,18 +121,30 @@ path and apply to SAN names and the subject DN of every certificate below
 the constraining CA.
 
 **Policy processing:** `valid_policy_set` starts as `{anyPolicy}` at the
-anchor and is narrowed per certificate.  A certificate without
-certificatePolicies collapses the set to NULL (sticky).  policyMappings of
-the issuer rewrite child policies unless inhibited by
-`policyConstraints.inhibitPolicyMapping`; `anyPolicy` keeps the set open
-unless inhibited by `inhibitAnyPolicy`.  Skip-count semantics: a constraint
-value `k` exempts the `k` certificates immediately below and takes effect
-at the `(k+1)`-th; multiple constraints combine with MIN.  Final
-acceptance: `requireExplicitPolicy` (when effective at the leaf) requires a
-non-NULL, non-anyPolicy-only set; the set must intersect the request's
-`initial_policy_set` (default `["anyPolicy"]`; `anyPolicy` in the valid set
-satisfies any specific initial policy).  policyMappings containing
-`anyPolicy` fail the path (`POLICY_MAPPING_ANY`).
+anchor and is narrowed per certificate, keeping each layer's surviving set
+in that certificate's *own* terms. A certificate without
+certificatePolicies collapses the set to NULL (sticky). policyMappings of
+the issuer link child policies to issuer-domain policies and **compose
+continuously across every CA level** (P1→P2 at one CA plus P2→P3 at the
+next lets a leaf asserting P3 satisfy initial policy P1); the request's
+`initial_policy_set` is descended through the whole composed mapping chain
+at final acceptance. `anyPolicy` keeps the set open unless inhibited by
+`inhibitAnyPolicy`. Skip-count semantics: a constraint value `k` exempts
+the `k` certificates immediately below and takes effect at the `(k+1)`-th
+(the certificate holding the counter is *not* exempted); multiple
+constraints combine with MIN. Final acceptance: `requireExplicitPolicy`
+(when effective at the leaf) requires a non-NULL, non-anyPolicy-only set;
+the descended set must intersect the request's `initial_policy_set`
+(default `["anyPolicy"]`; `anyPolicy` in the valid set satisfies any
+specific initial policy). policyMappings containing `anyPolicy` fail the
+path (`POLICY_MAPPING_ANY`). Every adjudication records a deterministic
+**`policy_trace`** in `decision.path_rules` (and, on policy failure, in the
+rejection proof's failure details): one entry per non-anchor certificate
+(anchor-adjacent first) with its asserted policies, the issuer mappings
+applied there, the effective inhibit/explicit controls, and the surviving
+own-terms policy set. The evidence pack carries the trace, so the offline
+verifier independently recomputes every layer; the canonical result is
+deterministic.
 
 **CRLs:** complete and delta CRLs.  Supported extensions: AKI
 (keyIdentifier), cRLNumber, deltaCRLIndicator, issuingDistributionPoint

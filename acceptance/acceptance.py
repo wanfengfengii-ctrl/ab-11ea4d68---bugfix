@@ -118,14 +118,89 @@ def build_dataset():
     leaf_cycle = make_leaf(cyc_x2, "Leaf Cycle", "ed", not_before=T("2022-01-01"),
                            not_after=T("2030-01-01"), eku=["1.3.6.1.5.5.7.3.3"])
 
+    # -- policy processing subtree -------------------------------------------
+    P1, P2, P3 = ("1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.2",
+                  "1.3.6.1.4.1.99999.3")
+    ANY_POL = "2.5.29.32.0"
+    pol_root = make_ca("Policy Root", "rsa", not_before=T("2020-01-01"),
+                       not_after=T("2040-01-01"))
+    # continuous two-level mapping: P1 -> P2 -> P3
+    pol_ca1 = make_ca("Policy CA1", "ec", issuer=pol_root,
+                      not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                      policies=[P1], policy_mappings=[(P1, P2)])
+    pol_ca2 = make_ca("Policy CA2", "ec", issuer=pol_ca1,
+                      not_before=T("2021-06-01"), not_after=T("2034-01-01"),
+                      policies=[P2], policy_mappings=[(P2, P3)])
+    leaf_pol_chain2 = make_leaf(pol_ca2, "Leaf Policy Chain2", "ed",
+                                not_before=T("2022-01-01"),
+                                not_after=T("2030-01-01"),
+                                eku=["1.3.6.1.5.5.7.3.3"], policies=[P3])
+    # single mapping: leaf asserts P2, CA maps P1 -> P2
+    leaf_pol_chain1 = make_leaf(pol_ca1, "Leaf Policy Chain1", "ed",
+                                not_before=T("2022-01-01"),
+                                not_after=T("2030-01-01"),
+                                eku=["1.3.6.1.5.5.7.3.3"], policies=[P2])
+    # anyPolicy down the chain satisfies a specific initial policy
+    pol_ca_any = make_ca("Policy Any CA", "ec", issuer=pol_root,
+                         not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                         policies=[ANY_POL])
+    leaf_pol_any = make_leaf(pol_ca_any, "Leaf Policy Any", "ed",
+                             not_before=T("2022-01-01"),
+                             not_after=T("2030-01-01"),
+                             eku=["1.3.6.1.5.5.7.3.3"], policies=[ANY_POL])
+    # leaf without certificatePolicies: NULL tree, accepted for anyPolicy
+    leaf_pol_empty = make_leaf(pol_ca1, "Leaf Policy Empty", "ed",
+                               not_before=T("2022-01-01"),
+                               not_after=T("2030-01-01"),
+                               eku=["1.3.6.1.5.5.7.3.3"])
+    # mapping inhibited exactly at the leaf-layer mapping (skip count 1)
+    pol_ca1_inh = make_ca("Policy CA1 Inhibited", "ec", issuer=pol_root,
+                          not_before=T("2021-01-01"),
+                          not_after=T("2035-01-01"), policies=[P1],
+                          policy_mappings=[(P1, P2)],
+                          policy_constraints={"inhibit_mapping": 1})
+    pol_ca2_inh = make_ca("Policy CA2 Inhibited", "ec", issuer=pol_ca1_inh,
+                          not_before=T("2021-06-01"),
+                          not_after=T("2034-01-01"), policies=[P2],
+                          policy_mappings=[(P2, P3)])
+    leaf_pol_inhibited = make_leaf(pol_ca2_inh, "Leaf Policy Inhibited", "ed",
+                                   not_before=T("2022-01-01"),
+                                   not_after=T("2030-01-01"),
+                                   eku=["1.3.6.1.5.5.7.3.3"], policies=[P3])
+    # explicit-policy skip-count boundary: 1 exempts the only cert below
+    pol_ca_ex1 = make_ca("Policy Explicit1", "ec", issuer=pol_root,
+                         not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                         policies=[ANY_POL],
+                         policy_constraints={"require_explicit": 1})
+    leaf_pol_ex1 = make_leaf(pol_ca_ex1, "Leaf Policy Explicit1", "ed",
+                             not_before=T("2022-01-01"),
+                             not_after=T("2030-01-01"),
+                             eku=["1.3.6.1.5.5.7.3.3"], policies=[ANY_POL])
+    # value 0 over the leaf: an anyPolicy-only tree is no longer acceptable
+    pol_ca_ex0 = make_ca("Policy Explicit0", "ec", issuer=pol_root,
+                         not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                         policies=[ANY_POL],
+                         policy_constraints={"require_explicit": 0})
+    leaf_pol_ex0 = make_leaf(pol_ca_ex0, "Leaf Policy Explicit0", "ed",
+                             not_before=T("2022-01-01"),
+                             not_after=T("2030-01-01"),
+                             eku=["1.3.6.1.5.5.7.3.3"], policies=[ANY_POL])
+
     certs = [root_a, root_b, inter, inter_b, leaf_ok, leaf_rev, leaf_stale,
              leaf_ocsp, leaf_delta, leaf_unsup, stale_ca, cyc_x, cyc_y, cyc_x2,
-             leaf_cycle]
+             leaf_cycle, pol_root, pol_ca1, pol_ca2, leaf_pol_chain2,
+             leaf_pol_chain1, pol_ca_any, leaf_pol_any, leaf_pol_empty,
+             pol_ca1_inh, pol_ca2_inh, leaf_pol_inhibited, pol_ca_ex1,
+             leaf_pol_ex1, pol_ca_ex0, leaf_pol_ex0]
     d.update(root_a=root_a, root_b=root_b, inter=inter, inter_b=inter_b,
              leaf_ok=leaf_ok, leaf_rev=leaf_rev, leaf_stale=leaf_stale,
              leaf_ocsp=leaf_ocsp, leaf_delta=leaf_delta, leaf_unsup=leaf_unsup,
              stale_ca=stale_ca, cyc_x=cyc_x, cyc_y=cyc_y, cyc_x2=cyc_x2,
-             leaf_cycle=leaf_cycle)
+             leaf_cycle=leaf_cycle, pol_root=pol_root,
+             leaf_pol_chain2=leaf_pol_chain2, leaf_pol_chain1=leaf_pol_chain1,
+             leaf_pol_any=leaf_pol_any, leaf_pol_empty=leaf_pol_empty,
+             leaf_pol_inhibited=leaf_pol_inhibited, leaf_pol_ex1=leaf_pol_ex1,
+             leaf_pol_ex0=leaf_pol_ex0)
 
     # noise: unrelated certs (cross-signed ring + junk) that must not disturb
     rng = random.Random(20240919)
@@ -185,6 +260,16 @@ def build_dataset():
     objects.append(("crl:cycle-y", make_crl(
         cyc_y, entries=[], crl_number=1, this_update=T("2024-05-01"),
         next_update=T("2024-07-01")), "crl", "2024-06-15T00:00:00Z"))
+    # policy subtree: every non-anchor cert covered by an empty valid CRL
+    for crl_name, issuer in (
+        ("pol-root", pol_root), ("pol-ca1", pol_ca1), ("pol-ca2", pol_ca2),
+        ("pol-ca-any", pol_ca_any), ("pol-ca1-inh", pol_ca1_inh),
+        ("pol-ca2-inh", pol_ca2_inh), ("pol-ca-ex1", pol_ca_ex1),
+        ("pol-ca-ex0", pol_ca_ex0),
+    ):
+        objects.append((f"crl:{crl_name}", make_crl(
+            issuer, entries=[], crl_number=1, this_update=T("2024-05-01"),
+            next_update=T("2024-07-01")), "crl", "2024-06-15T00:00:00Z"))
     # delta CRL chain: base carries leaf_rev forward, delta adds leaf_delta
     objects.append(("crl:delta-base", make_crl(
         inter, entries=[(leaf_rev.cert.serial_number, T("2024-03-01"),
@@ -371,6 +456,139 @@ def main():
     check("late evidence excluded", acct.get(late_fp, {}).get("reason") == "RECEIVED_AFTER_CUTOFF")
     check("late evidence did not change verdict",
           results["valid-cross-signed"]["verdict"] == "VALID")
+
+    # -- policy processing scenarios ------------------------------------------
+    P1, P2, P3 = ("1.3.6.1.4.1.99999.1", "1.3.6.1.4.1.99999.2",
+                  "1.3.6.1.4.1.99999.3")
+    P_OTHER = "1.3.6.1.4.1.99999.9"
+    policy_anchor = d["pol_root"]
+
+    def adjudicate_policy(name, leaf, initial, expected):
+        """Adjudicate a policy leaf; returns the parsed result body."""
+        inp = adjudication_input(leaf, [policy_anchor])
+        inp["initial_policy_set"] = [initial]
+        r = post(API_A, "/v1/adjudications",
+                 {"request_id": f"acc-{RUN}-pol-{name}",
+                  "evidence_set_id": set_id, "input": inp})
+        check(f"policy {name}: adjudicated", r.status_code == 201, r.text[:300])
+        body = json.loads(r.content)
+        check(f"policy {name}: verdict {expected}", body["verdict"] == expected,
+              f"got {body['verdict']}")
+        # cross-instance determinism
+        r_b = post(API_B, "/v1/adjudications",
+                   {"request_id": f"acc-{RUN}-pol-b-{name}",
+                    "evidence_set_id": set_id, "input": inp})
+        check(f"policy {name}: cross-instance determinism", r_b.content == r.content)
+        return body
+
+    def policy_rule(body):
+        for rule in body["decision"]["path_rules"] or []:
+            if rule["rule"] == "POLICIES":
+                return rule
+        return None
+
+    # 1. the headline fix: two-level continuous mapping P1 -> P2 -> P3
+    body = adjudicate_policy("continuous-two-level", d["leaf_pol_chain2"], P1, "VALID")
+    pr = policy_rule(body)
+    check("continuous mapping valid_policies", pr is not None
+          and pr.get("valid_policies") == [P3], json.dumps(pr)[:400])
+    trace = pr.get("policy_trace") if pr else None
+    check("continuous mapping trace complete", trace is not None
+          and [layer["valid_policies"] for layer in trace] == [[P1], [P2], [P3]],
+          json.dumps(trace)[:400])
+    check("continuous mapping records mappings", trace is not None
+          and len(trace[1]["mappings"]) == 1 and len(trace[2]["mappings"]) == 1)
+    # the evidence pack must let the verdict + per-layer state be recomputed
+    # offline from the pack file alone
+    pack = requests.get(
+        f"{API_A}/v1/adjudications/{body['adjudication_id']}/evidence-pack",
+        timeout=120)
+    check("continuous mapping pack download", pack.status_code == 200)
+    check("continuous mapping pack digest header",
+          pack.headers.get("X-Evidence-Pack-SHA256")
+          == hashlib.sha256(pack.content).hexdigest())
+    with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as fh:
+        fh.write(pack.content)
+        pack_path = fh.name
+    proc = subprocess.run([sys.executable, "-m", "app.verify", pack_path],
+                          capture_output=True, text=True,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    check("continuous mapping pack offline verification", proc.returncode == 0,
+          proc.stdout[-300:] + proc.stderr[-300:])
+    pack_obj = json.loads(pack.content)
+    pack_trace = next(
+        r for r in pack_obj["result"]["decision"]["path_rules"]
+        if r["rule"] == "POLICIES")["policy_trace"]
+    check("continuous mapping pack records trace",
+          [layer["valid_policies"] for layer in pack_trace] == [[P1], [P2], [P3]])
+    # same chain must not satisfy an unrelated initial policy
+    bad = adjudicate_policy("continuous-unrelated", d["leaf_pol_chain2"], P_OTHER,
+                            "INVALID")
+    codes = bad["summary"]["failure_codes"]
+    check("continuous unrelated first failure",
+          "POLICY_INITIAL_SET_MISMATCH" in codes, json.dumps(codes))
+    pfb = next((b["failure"] for b in
+                bad["decision"]["rejection_proof"]["branches"]
+                if b["failure"]["rule"] == "POLICIES"), None)
+    check("continuous unrelated failure has trace",
+          pfb is not None and len(pfb.get("details", {}).get("policy_trace", [])) == 3)
+
+    # 2. single-level mapping regression
+    body = adjudicate_policy("single-mapping", d["leaf_pol_chain1"], P1, "VALID")
+    pr = policy_rule(body)
+    check("single mapping valid_policies", pr is not None
+          and pr.get("valid_policies") == [P2])
+
+    # 3. anyPolicy
+    body = adjudicate_policy("any-policy", d["leaf_pol_any"], P1, "VALID")
+    pr = policy_rule(body)
+    check("anyPolicy satisfies specific initial set", pr is not None
+          and pr.get("valid_policies") == [P1])
+
+    # 4. empty policy tree (NULL), anyPolicy initial set -> VALID
+    body = adjudicate_policy("empty-tree-any", d["leaf_pol_empty"], "anyPolicy",
+                             "VALID")
+    pr = policy_rule(body)
+    check("empty tree accepted for anyPolicy", pr is not None
+          and pr.get("valid_policies") == [])
+    # same NULL tree with a specific initial set -> INVALID
+    bad = adjudicate_policy("empty-tree-specific", d["leaf_pol_empty"], P1,
+                            "INVALID")
+    check("empty tree specific mismatch",
+          "POLICY_INITIAL_SET_MISMATCH" in bad["summary"]["failure_codes"])
+
+    # 5. mapping suppression: inhibitPolicyMapping=1 hits the leaf-layer edge
+    bad = adjudicate_policy("mapping-inhibited", d["leaf_pol_inhibited"], P1,
+                            "INVALID")
+    check("mapping inhibited mismatch",
+          "POLICY_INITIAL_SET_MISMATCH" in bad["summary"]["failure_codes"])
+
+    # 6. explicit-policy skip-count boundary: 1 exempts the leaf -> VALID
+    body = adjudicate_policy("explicit-skip-1", d["leaf_pol_ex1"], "anyPolicy",
+                             "VALID")
+    pr = policy_rule(body)
+    check("explicit skip=1 allows anyPolicy leaf", pr is not None
+          and pr.get("result") == "pass")
+    # value 0 over the same shape -> INVALID / POLICY_EXPLICIT_REQUIRED
+    bad = adjudicate_policy("explicit-skip-0", d["leaf_pol_ex0"], "anyPolicy",
+                            "INVALID")
+    check("explicit skip=0 rejects anyPolicy-only tree",
+          "POLICY_EXPLICIT_REQUIRED" in bad["summary"]["failure_codes"],
+          json.dumps(bad["summary"]["failure_codes"]))
+
+    # the continuous-mapping VALID pack must verify offline from the pack alone
+    pack = requests.get(
+        f"{API_A}/v1/adjudications/{body['adjudication_id']}/evidence-pack",
+        timeout=120)
+    check("explicit-skip pack download", pack.status_code == 200)
+    with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as fh:
+        fh.write(pack.content)
+        pack_path = fh.name
+    proc = subprocess.run([sys.executable, "-m", "app.verify", pack_path],
+                          capture_output=True, text=True,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    check("explicit-skip pack offline verification", proc.returncode == 0,
+          proc.stdout[-300:] + proc.stderr[-300:])
 
     # -- evidence pack + offline verification --------------------------------
     adj_id = results["valid-cross-signed"]["adjudication_id"]
