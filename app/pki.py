@@ -420,145 +420,334 @@ def check_name_constraints(path: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Certification path policy processing (RFC 5280 section 6.1), profile subset
+# Certification path policy processing (RFC 5280 section 6.1)
 # ---------------------------------------------------------------------------
+
+class _PolicyNode:
+    """A node of the RFC 5280 valid_policy_tree.
+
+    ``valid_policy`` is the policy asserted at this depth (the sentinel
+    ``anyPolicy`` denotes the special OID 2.5.29.32.0); ``expected`` is the
+    node's expected_policy_set for the next certificate.  The tree keeps
+    expected_policy_set explicitly: a policyMappings extension on a CA
+    rewrites the expected sets of its nodes, so a mapping chain P1->P2 on one
+    CA and P2->P3 on the next composes exactly as RFC 5280 prescribes.
+    """
+
+    __slots__ = ("valid_policy", "expected", "children")
+
+    def __init__(self, valid_policy: str, expected=None, children=None):
+        self.valid_policy = valid_policy
+        self.expected = expected if expected is not None else {valid_policy}
+        self.children = children if children is not None else []
+
+
+def _nodes_at_depth(root: _PolicyNode, depth: int) -> list:
+    level = [root]
+    for _ in range(depth):
+        level = [child for node in level for child in node.children]
+    return level
+
+
+def _level_policy_set(root: _PolicyNode | None, depth: int):
+    """Sorted valid policies present at *depth* (None when the tree is NULL)."""
+    if root is None:
+        return None
+    return sorted({node.valid_policy for node in _nodes_at_depth(root, depth)})
+
+
+def _prune_dead_branches(node: _PolicyNode, depth: int, leaf_depth: int) -> bool:
+    """RFC 5280 6.1.3 (d)(3): drop parent nodes left without children.
+
+    Returns whether *node* survives.
+    """
+    if depth >= leaf_depth:
+        return True
+    node.children = [
+        child for child in node.children
+        if _prune_dead_branches(child, depth + 1, leaf_depth)
+    ]
+    return bool(node.children)
+
 
 def evaluate_policies(path: list, initial_policy_set: list) -> dict:
     """Evaluate certificate policies for a candidate path (leaf-first order).
 
-    Returns a rule result dict; on success includes ``valid_policies``.
+    Implements the RFC 5280 section 6.1 valid_policy_tree state machine with
+    the skip-counter semantics documented for this profile:
+      * The trust anchor contributes only the initial tree root (anyPolicy);
+        its own extensions are not processed.
+      * Certificates are processed from the CA directly below the anchor down
+        to the leaf.  Every node carries an expected_policy_set, so a
+        policyMappings extension rewrites the policies that satisfy the node
+        one level down and mappings compose continuously across multiple CA
+        levels (P1->P2 then P2->P3 leaves P3 satisfying P1).
+      * Skip counters are position based.  For a constraint value ``k`` on a
+        CA at depth ``j`` and the certificate at depth ``i`` below it, the
+        effective value is ``k - (i - j)``; constraints from multiple CAs
+        combine with MIN.  Mapping is permitted and anyPolicy is processed
+        while the effective value is non-negative (an effective 0 still
+        permits, i.e. a skip of ``k`` exempts the ``k`` certificates
+        immediately below); requireExplicitPolicy binds once the effective
+        value becomes negative.
+      * When policy mapping is inhibited for a child, the issuer's mappings
+        simply do not rewrite that child's expected policies; the policies
+        the CA itself asserts are retained.  A policyMappings extension
+        naming anyPolicy always fails the path (POLICY_MAPPING_ANY).
+      * Profile tightening (documented in README): requireExplicitPolicy
+        effective at the leaf rejects a NULL tree or a tree whose only leaf
+        is anyPolicy.
 
-    Profile semantics (documented in README):
-      * The trust anchor is treated as ``anyPolicy``; its own extensions are
-        not processed.
-      * ``valid_policy_set`` starts as {anyPolicy} at the anchor and is
-        narrowed certificate by certificate down to the leaf.  A certificate
-        without certificatePolicies collapses the set to NULL (sticky).
-      * policyMappings of the issuer rewrite child policies, unless inhibited.
-      * anyPolicy in a certificate keeps the set open, unless inhibited.
-      * Skip-count semantics (RFC 5280 4.2.1.11 / 4.2.1.14): a constraint
-        value ``k`` on the certificate at position ``p`` exempts the ``k``
-        certificates immediately below it and takes effect at the
-        ``(k+1)``-th certificate below; multiple constraints combine with
-        MIN.  Trust-anchor extensions are ignored.
-      * Final acceptance: the valid set must satisfy requireExplicitPolicy
-        (if effective at the leaf) and intersect the initial policy set
-        (an initial set of [anyPolicy] accepts anything the tree asserts,
-        including a NULL tree when explicit policy is not required).
+    Returns a rule result dict; on success it includes ``valid_policies`` and
+    a deterministic ``policy_trace`` recording the per-certificate tree state
+    so the outcome can be recomputed offline from the evidence pack alone.
     """
-    n = len(path) - 1  # anchor index
+    n = len(path) - 1  # anchor index in the leaf-first path
 
-    def pending_at(kind: str, idx: int):
-        """Effective skip-counter value at *idx*; None when unconstrained."""
+    # top-down order of the non-anchor certificates (RFC certificates 1..n)
+    certs = [path[i] for i in range(n - 1, -1, -1)]
+
+    def counter_value(kind: str, target_depth: int, max_source_depth: int):
+        """Effective skip value at *target_depth* from constraints on certs
+        at depths 1..max_source_depth; None when no constraint applies."""
         best = None
-        for p in range(idx + 1, n):
-            cert = path[p]
+        for j in range(1, max_source_depth + 1):
+            cert = certs[j - 1]
             if kind == "require_explicit":
-                k = cert.policy_constraints.get("require_explicit") if cert.policy_constraints else None
+                k = cert.policy_constraints.get("require_explicit") \
+                    if cert.policy_constraints else None
             elif kind == "inhibit_mapping":
-                k = cert.policy_constraints.get("inhibit_mapping") if cert.policy_constraints else None
-            else:  # inhibit_any
+                k = cert.policy_constraints.get("inhibit_mapping") \
+                    if cert.policy_constraints else None
+            else:
                 k = cert.inhibit_any_policy
             if k is None:
                 continue
-            v = k - (p - idx)
+            v = k - (target_depth - j)
             best = v if best is None else min(best, v)
         return best
 
-    valid = {ANY_POLICY}  # None represents the NULL valid_policy_tree
-    for idx in range(n - 1, -1, -1):
-        cert = path[idx]
-        mapping_allowed = (pending_at("inhibit_mapping", idx) or 1) > 0
-        any_allowed = (pending_at("inhibit_any", idx) or 1) > 0
+    root = _PolicyNode(ANY_POLICY, {ANY_POLICY})
+    trace_entries = []
 
-        parent_mappings = []
-        if idx + 1 <= n - 1:
-            parent_mappings = path[idx + 1].policy_mappings
-        mapped_issuer_policies = {}
-        if mapping_allowed:
-            for (ip, sp) in parent_mappings:
-                if ip == ANY_POLICY_OID or sp == ANY_POLICY_OID:
-                    return {
-                        "result": "fail",
-                        "code": "POLICY_MAPPING_ANY",
-                        "certificate": path[idx + 1].fingerprint,
-                        "detail": f"policyMappings with anyPolicy at {path[idx+1].fingerprint}",
-                    }
-                mapped_issuer_policies.setdefault(sp, []).append(ip)
-
-        if valid is None:
-            continue  # NULL tree is sticky; counters are position-based
-        cert_policies = cert.policies
-        if cert_policies is None:
-            valid = None
-            continue
-        oids = list(cert_policies)
-        has_any = ANY_POLICY_OID in oids
-        oids = [p for p in oids if p != ANY_POLICY_OID]
-        if ANY_POLICY in valid:
-            # open set: narrow to the cert's policies (with mappings)
-            new_valid = set()
-            if has_any and any_allowed:
-                new_valid.add(ANY_POLICY)
-            for p in oids:
-                new_valid.add(p)
-                for ip in mapped_issuer_policies.get(p, []):
-                    new_valid.add(ip)
-            valid = new_valid if new_valid else None
-        else:
-            new_valid = set()
-            if has_any and any_allowed:
-                new_valid |= valid
-            for p in oids:
-                if p in valid:
-                    new_valid.add(p)
-                for ip in mapped_issuer_policies.get(p, []):
-                    if ip in valid:
-                        new_valid.add(ip)
-            valid = new_valid if new_valid else None
-
-    explicit_required = (pending_at("require_explicit", 0) or 1) <= 0
-    initial = list(initial_policy_set) if initial_policy_set else [ANY_POLICY]
-    initial_specific = ANY_POLICY not in initial and ANY_POLICY_OID not in initial
-
-    if valid is None:
-        if explicit_required:
-            return {
-                "result": "fail",
-                "code": "POLICY_TREE_EMPTY",
-                "certificate": path[0].fingerprint,
-                "detail": "explicit policy required but the valid policy tree is null",
-            }
-        if initial_specific:
-            return {
-                "result": "fail",
-                "code": "POLICY_INITIAL_SET_MISMATCH",
-                "certificate": path[0].fingerprint,
-                "detail": "no policies are asserted but the initial policy set is specific",
-            }
-        return {"result": "pass", "valid_policies": []}
-    if valid == {ANY_POLICY}:
-        if explicit_required:
-            return {
-                "result": "fail",
-                "code": "POLICY_EXPLICIT_REQUIRED",
-                "certificate": path[0].fingerprint,
-                "detail": "explicit policy required but only anyPolicy remains",
-            }
+    def fail(code, cert, detail):
         return {
-            "result": "pass",
-            "valid_policies": sorted(initial) if initial_specific else [ANY_POLICY],
+            "result": "fail",
+            "code": code,
+            "certificate": cert.fingerprint,
+            "detail": detail,
+            "policy_trace": {"certificates": trace_entries, "wrap_up": None},
         }
-    if initial_specific:
-        if ANY_POLICY in valid:
-            return {"result": "pass", "valid_policies": sorted(initial)}
-        inter = valid & set(initial)
-        if not inter:
-            return {
-                "result": "fail",
-                "code": "POLICY_INITIAL_SET_MISMATCH",
-                "certificate": path[0].fingerprint,
-                "detail": f"valid policies {sorted(valid)} do not intersect initial policy set",
-            }
-        return {"result": "pass", "valid_policies": sorted(inter)}
-    return {"result": "pass", "valid_policies": sorted(valid)}
+
+    for i, cert in enumerate(certs, start=1):
+        is_leaf = i == n
+        policies = cert.policies
+        any_v = counter_value("inhibit_any", i, i - 1)
+        # effective 0 still permits: a skip of k exempts the k certs below
+        any_permitted = any_v is None or any_v >= 0
+        explicit_v = counter_value("require_explicit", i, i - 1)
+        explicit_required_here = explicit_v is not None and explicit_v < 0
+
+        # -- RFC 6.1.3 (d): basic policy processing -----------------------
+        post_basic = None
+        if root is not None and policies is not None:
+            parents = _nodes_at_depth(root, i - 1)
+            any_parents = [node for node in parents if node.valid_policy == ANY_POLICY]
+            specific = [p for p in policies if p != ANY_POLICY_OID]
+            for p_oid in specific:
+                # (d)(1)(i): exact match against parent expected_policy_set
+                matched = [node for node in parents if p_oid in node.expected]
+                if matched:
+                    for node in matched:
+                        node.children.append(_PolicyNode(p_oid, {p_oid}))
+                elif any_parents:
+                    # (d)(1)(ii): unmatched policy under an anyPolicy node
+                    for node in any_parents:
+                        node.children.append(_PolicyNode(p_oid, {p_oid}))
+            if ANY_POLICY_OID in policies and any_permitted:
+                # (d)(2): anyPolicy carries every still-expected value over
+                for node in parents:
+                    present = {child.valid_policy for child in node.children}
+                    for expected in sorted(node.expected):
+                        if expected not in present:
+                            node.children.append(
+                                _PolicyNode(expected, {expected})
+                            )
+                            present.add(expected)
+            # (d)(3): prune parent nodes left without children
+            if not _prune_dead_branches(root, 0, i):
+                root = None
+            else:
+                post_basic = _level_policy_set(root, i)
+        elif policies is None:
+            # (e): absent certificatePolicies extension -> NULL tree (sticky)
+            root = None
+
+        post_mapping = post_basic
+        mapping_permitted = None
+        if not is_leaf:
+            # -- this CA's policy mappings rewrite the next certificate.
+            #    The gate is evaluated at the child position, so a
+            #    constraint on this CA also governs its own mappings.
+            map_v = counter_value("inhibit_mapping", i + 1, i)
+            mapping_permitted = map_v is None or map_v >= 0
+            # once the tree is NULL policy processing ceases (RFC 6.1.2);
+            # the mappings are recorded in the trace but not applied
+            if cert.policy_mappings and root is not None and mapping_permitted:
+                # RFC 6.1.4 (a): anyPolicy in an applicable mapping fails;
+                # a mapping that is inhibited is ignored wholesale
+                if any(ip == ANY_POLICY_OID or sp == ANY_POLICY_OID
+                       for ip, sp in cert.policy_mappings):
+                    trace_entries.append(_trace_entry(
+                        cert, i, policies,
+                        sorted((ip, sp) for ip, sp in cert.policy_mappings),
+                        any_permitted, mapping_permitted, post_basic,
+                        explicit_required=explicit_required_here))
+                    return fail("POLICY_MAPPING_ANY", cert,
+                                f"policyMappings with anyPolicy at {cert.fingerprint}")
+                # RFC 6.1.4 (b)(1): rewrite expected_policy_set values
+                grouped: dict = {}
+                for ip, sp in cert.policy_mappings:
+                    grouped.setdefault(ip, set()).add(sp)
+                level_nodes = _nodes_at_depth(root, i)
+                for ip in sorted(grouped):
+                    targets = [nd for nd in level_nodes if nd.valid_policy == ip]
+                    for nd in targets:
+                        nd.expected = set(grouped[ip])
+                    if not targets:
+                        # an absent issuer policy under an anyPolicy node
+                        # becomes an equivalent branch
+                        for parent in _nodes_at_depth(root, i - 1):
+                            if parent.valid_policy != ANY_POLICY:
+                                continue
+                            if any(c.valid_policy == ANY_POLICY
+                                   for c in parent.children) and not any(
+                                c.valid_policy == ip for c in parent.children
+                            ):
+                                parent.children.append(
+                                    _PolicyNode(ip, set(grouped[ip])))
+                post_mapping = _level_policy_set(root, i)
+            # when mapping is inhibited (or the tree is NULL) the mappings
+            # are recorded in the trace but not applied
+
+        trace_entries.append(_trace_entry(
+            cert, i, policies,
+            sorted((ip, sp) for ip, sp in cert.policy_mappings),
+            any_permitted, mapping_permitted, post_basic, post_mapping,
+            explicit_required_here))
+
+    # -- wrap-up: explicit policy gate at the leaf -------------------------
+    leaf_cert = certs[-1]
+    explicit_v = counter_value("require_explicit", n, n - 1)
+    explicit_required = explicit_v is not None and explicit_v < 0
+
+    initial = list(initial_policy_set) if initial_policy_set else [ANY_POLICY]
+    initial_is_any_policy = ANY_POLICY in initial or ANY_POLICY_OID in initial
+    initial_set = {p for p in initial if p != ANY_POLICY and p != ANY_POLICY_OID}
+
+    wrap_up = {
+        "explicit_policy_required": explicit_required,
+        "initial_policy_set": sorted(set(initial)),
+        "valid_policies": None,
+    }
+    trace = {"certificates": trace_entries, "wrap_up": wrap_up}
+
+    def terminal_fail(code, detail):
+        return {"result": "fail", "code": code,
+                "certificate": leaf_cert.fingerprint, "detail": detail,
+                "policy_trace": trace}
+
+    if root is None:
+        if explicit_required:
+            return terminal_fail(
+                "POLICY_TREE_EMPTY",
+                "explicit policy required but the valid policy tree is null")
+        if not initial_is_any_policy:
+            return terminal_fail(
+                "POLICY_INITIAL_SET_MISMATCH",
+                "no policies are asserted but the initial policy set is specific")
+        wrap_up["valid_policies"] = []
+        return {"result": "pass", "valid_policies": [], "policy_trace": trace}
+
+    leaf_policies = {nd.valid_policy for nd in _nodes_at_depth(root, n)}
+    if explicit_required and leaf_policies == {ANY_POLICY}:
+        return terminal_fail(
+            "POLICY_EXPLICIT_REQUIRED",
+            "explicit policy required but only anyPolicy remains")
+
+    if not initial_is_any_policy:
+        # RFC 6.1.5 (g)(iii): intersect the tree with the user initial set.
+        # A branch starts wherever a specific policy appears beneath an
+        # anyPolicy node (at any depth); such a branch survives only when its
+        # entry policy is in the initial set.  anyPolicy branch nodes are
+        # retained, and an anyPolicy leaf satisfies every requested policy
+        # (step 3 synthesizes one leaf per requested OID).
+        def prune_for_initial_set(node: _PolicyNode, depth: int) -> bool:
+            kept = []
+            for child in node.children:
+                dropped = (
+                    node.valid_policy == ANY_POLICY
+                    and child.valid_policy != ANY_POLICY
+                    and child.valid_policy not in initial_set
+                )
+                if not dropped and prune_for_initial_set(child, depth + 1):
+                    kept.append(child)
+            node.children = kept
+            return depth == n or bool(kept)
+
+        tree_survives = prune_for_initial_set(root, 0)
+        surviving_leaf_policies = (
+            {nd.valid_policy for nd in _nodes_at_depth(root, n)}
+            if tree_survives else set()
+        )
+        # RFC 6.1.5(g)(iii)3: an anyPolicy node still present at leaf depth
+        # after branch pruning synthesizes one leaf per requested OID
+        any_policy_leaf = ANY_POLICY in surviving_leaf_policies
+        final = set()
+        if any_policy_leaf:
+            final |= initial_set
+
+        def collect_entries(node: _PolicyNode):
+            for child in node.children:
+                if node.valid_policy == ANY_POLICY and child.valid_policy != ANY_POLICY:
+                    final.add(child.valid_policy)
+                collect_entries(child)
+
+        if tree_survives:
+            collect_entries(root)
+        wrap_up["valid_policies_before_intersection"] = sorted(leaf_policies)
+        wrap_up["valid_policies"] = sorted(final)
+        if not final or not tree_survives:
+            return terminal_fail(
+                "POLICY_INITIAL_SET_MISMATCH",
+                f"valid policies {sorted(leaf_policies)} do not intersect "
+                f"initial policy set")
+        return {"result": "pass", "valid_policies": sorted(final),
+                "policy_trace": trace}
+
+    # RFC 6.1.5 (g)(ii): an any-policy initial set accepts the whole tree.
+    final = sorted(leaf_policies)
+    wrap_up["valid_policies_before_intersection"] = final
+    wrap_up["valid_policies"] = final
+    return {"result": "pass", "valid_policies": final, "policy_trace": trace}
+
+
+def _trace_entry(cert, depth, policies, mappings, any_permitted,
+                 mapping_permitted, valid_after_certificate,
+                 valid_after_mappings=None, explicit_required=False) -> dict:
+    """A deterministic per-layer policy state record for offline recomputation."""
+    if valid_after_mappings is None:
+        valid_after_mappings = valid_after_certificate
+    entry = {
+        "certificate": cert.fingerprint,
+        "depth": depth,
+        "policies": list(policies) if policies is not None else None,
+        "policy_mappings": [list(m) for m in mappings] if mappings else [],
+        "any_policy_processed": bool(any_permitted and policies is not None
+                                     and ANY_POLICY_OID in policies),
+        "mapping_permitted": mapping_permitted,
+        "explicit_policy_required": explicit_required,
+        "valid_policies_after_certificate": valid_after_certificate,
+        "valid_policies_after_mappings": valid_after_mappings,
+    }
+    return entry

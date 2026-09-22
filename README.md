@@ -120,19 +120,33 @@ constraints match by RDN-subtree prefix.  Constraints accumulate down the
 path and apply to SAN names and the subject DN of every certificate below
 the constraining CA.
 
-**Policy processing:** `valid_policy_set` starts as `{anyPolicy}` at the
-anchor and is narrowed per certificate.  A certificate without
-certificatePolicies collapses the set to NULL (sticky).  policyMappings of
-the issuer rewrite child policies unless inhibited by
-`policyConstraints.inhibitPolicyMapping`; `anyPolicy` keeps the set open
+**Policy processing:** implemented as the RFC 5280 §6.1 `valid_policy_tree`
+state machine.  The tree starts with a single anyPolicy node at the anchor
+(the anchor's own extensions are not processed), and certificates are
+processed from the CA directly below the anchor down to the leaf.  Every
+node carries an `expected_policy_set`, so a `policyMappings` extension on a
+CA rewrites the policies that satisfy the node one level down; mappings
+therefore **compose continuously across CA levels** (a CA asserting P1 and
+mapping P1→P2 above a CA asserting P2 and mapping P2→P3 makes a leaf that
+asserts P3 valid for the initial policy P1, and this extends to any number
+of mapping CAs).  A certificate without certificatePolicies collapses the
+tree to NULL (sticky); `anyPolicy` keeps every still-expected branch open
 unless inhibited by `inhibitAnyPolicy`.  Skip-count semantics: a constraint
 value `k` exempts the `k` certificates immediately below and takes effect
-at the `(k+1)`-th; multiple constraints combine with MIN.  Final
-acceptance: `requireExplicitPolicy` (when effective at the leaf) requires a
-non-NULL, non-anyPolicy-only set; the set must intersect the request's
-`initial_policy_set` (default `["anyPolicy"]`; `anyPolicy` in the valid set
-satisfies any specific initial policy).  policyMappings containing
-`anyPolicy` fail the path (`POLICY_MAPPING_ANY`).
+at the `(k+1)`-th (effective value 0 still permits; the gate binds when the
+effective value becomes negative); multiple constraints combine with MIN,
+and a CA's own `inhibitPolicyMapping` governs the applicability of its own
+mappings — when inhibited the mappings simply do not rewrite (the asserted
+policies remain).  Final acceptance: `requireExplicitPolicy` (when effective
+at the leaf) requires a non-NULL, non-anyPolicy-only tree; RFC §6.1.5(g)
+then intersects the tree with the request's `initial_policy_set` (default
+`["anyPolicy"]`; an anyPolicy leaf satisfies any specific initial policy).
+policyMappings containing `anyPolicy` always fail the path
+(`POLICY_MAPPING_ANY`).  Results and evidence packs record a deterministic
+per-certificate **`policy_trace`** (asserted policies, applied mappings,
+whether anyPolicy/mapping were permitted, the valid policy set after the
+certificate and after its mappings, plus the wrap-up intersection), so the
+policy decision can be independently recomputed offline from the pack.
 
 **CRLs:** complete and delta CRLs.  Supported extensions: AKI
 (keyIdentifier), cRLNumber, deltaCRLIndicator, issuingDistributionPoint

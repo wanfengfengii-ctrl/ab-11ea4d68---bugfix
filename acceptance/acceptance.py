@@ -49,6 +49,12 @@ SIGNED_AT = "2024-06-01T00:00:00Z"
 CUTOFF = "2025-01-01T00:00:00Z"
 EARLY = "2024-01-01T00:00:00Z"
 
+# policy OIDs for the continuous policy-mapping scenario
+POLICY_P1 = "1.3.6.1.4.1.58181.1"
+POLICY_P2 = "1.3.6.1.4.1.58181.2"
+POLICY_P3 = "1.3.6.1.4.1.58181.3"
+POLICY_P4 = "1.3.6.1.4.1.58181.4"
+
 _failures = []
 
 
@@ -218,10 +224,11 @@ def build_dataset():
     return d, objects
 
 
-def adjudication_input(leaf, anchors, artifact=b"acceptance artifact"):
+def adjudication_input(leaf, anchors, artifact=b"acceptance artifact",
+                       initial_policy_set=None):
     digest = hashlib.sha256(artifact).hexdigest()
     sig = sign_data(leaf.key, bytes.fromhex(digest))
-    return {
+    inp = {
         "artifact_digest": digest,
         "signature": base64.b64encode(sig).decode(),
         "signature_algorithm": artifact_algorithm_for(leaf.key),
@@ -230,6 +237,85 @@ def adjudication_input(leaf, anchors, artifact=b"acceptance artifact"):
         "leaf_fingerprint": sha256_hex(leaf.der),
         "trust_anchors": [sha256_hex(a.der) for a in anchors],
     }
+    if initial_policy_set is not None:
+        inp["initial_policy_set"] = initial_policy_set
+    return inp
+
+
+def build_policy_dataset():
+    """Continuous policy-mapping chains and their boundary scenarios.
+
+    The headline chain is root <- I1 (P1, maps P1->P2) <- I2 (P2, maps
+    P2->P3) <- leaf (P3); with initial policy set [P1] it must validate.
+    Companion leaves exercise single mapping, anyPolicy, the empty policy
+    tree, mapping inhibition and requireExplicitPolicy boundaries.
+    """
+    objects = []
+    root = make_ca("Policy Root", "rsa", not_before=T("2020-01-01"),
+                   not_after=T("2040-01-01"))
+    i1 = make_ca("Policy I1", "ec", issuer=root, not_before=T("2021-01-01"),
+                 not_after=T("2035-01-01"), policies=[POLICY_P1],
+                 policy_mappings=[(POLICY_P1, POLICY_P2)])
+    i2 = make_ca("Policy I2", "ec", issuer=i1, not_before=T("2021-01-01"),
+                 not_after=T("2035-01-01"), policies=[POLICY_P2],
+                 policy_mappings=[(POLICY_P2, POLICY_P3)])
+    # three-level extension chain for a second fixture set
+    j1 = make_ca("Policy J1", "ec", issuer=root, not_before=T("2021-01-01"),
+                 not_after=T("2035-01-01"), policies=[POLICY_P1],
+                 policy_mappings=[(POLICY_P1, POLICY_P2)])
+    j2 = make_ca("Policy J2", "ec", issuer=j1, not_before=T("2021-01-01"),
+                 not_after=T("2035-01-01"), policies=[POLICY_P2],
+                 policy_mappings=[(POLICY_P2, POLICY_P3)])
+    j3 = make_ca("Policy J3", "ec", issuer=j2, not_before=T("2021-01-01"),
+                 not_after=T("2035-01-01"), policies=[POLICY_P3],
+                 policy_mappings=[(POLICY_P3, POLICY_P4)])
+
+    def _leaf(issuer, cn, **kw):
+        return make_leaf(issuer, cn, "ed", not_before=T("2022-01-01"),
+                         not_after=T("2030-01-01"),
+                         eku=["1.3.6.1.5.5.7.3.3"], **kw)
+
+    leaf_chain = _leaf(i2, "Policy Leaf P1P2P3", policies=[POLICY_P3])
+    leaf_three = _leaf(j3, "Policy Leaf P1P2P3P4", policies=[POLICY_P4])
+    leaf_any = _leaf(i2, "Policy Leaf Any", policies=["2.5.29.32.0"])
+    leaf_nopol = _leaf(i2, "Policy Leaf NoPol")
+
+    # mapping inhibition: the CA's own inhibitPolicyMapping=0 blocks its
+    # P1->P2 mapping, so a leaf asserting P2 cannot satisfy [P1]
+    root_inh = make_ca("Policy Root Inh", "rsa", not_before=T("2020-01-01"),
+                       not_after=T("2040-01-01"))
+    i_inh = make_ca("Policy I Inh", "ec", issuer=root_inh,
+                    not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                    policies=[POLICY_P1], policy_mappings=[(POLICY_P1, POLICY_P2)],
+                    policy_constraints={"inhibit_mapping": 0})
+    leaf_inh = _leaf(i_inh, "Policy Leaf Inh", policies=[POLICY_P2])
+
+    # requireExplicitPolicy=0 on the CA directly above the leaf
+    root_req = make_ca("Policy Root Req", "rsa", not_before=T("2020-01-01"),
+                       not_after=T("2040-01-01"))
+    i_req = make_ca("Policy I Req", "ec", issuer=root_req,
+                    not_before=T("2021-01-01"), not_after=T("2035-01-01"),
+                    policies=[POLICY_P1],
+                    policy_constraints={"require_explicit": 0})
+    leaf_req_ok = _leaf(i_req, "Policy Leaf ReqOK", policies=[POLICY_P1])
+    leaf_req_empty = _leaf(i_req, "Policy Leaf ReqEmpty")
+
+    certs = [root, i1, i2, j1, j2, j3, leaf_chain, leaf_three, leaf_any,
+             leaf_nopol, root_inh, i_inh, leaf_inh, root_req, i_req,
+             leaf_req_ok, leaf_req_empty]
+    for e in certs:
+        objects.append((f"cert:{e.cn}:{sha256_hex(e.der)[:8]}", e.der,
+                        "certificate", EARLY))
+    for ca in (root, i1, i2, j1, j2, j3, root_inh, i_inh, root_req, i_req):
+        objects.append((f"crl:{ca.cn}", make_crl(
+            ca, entries=[], crl_number=1, this_update=T("2024-05-01"),
+            next_update=T("2024-07-01")), "crl", EARLY))
+    d = {"root": root, "i1": i1, "i2": i2, "leaf_chain": leaf_chain,
+         "leaf_three": leaf_three, "leaf_any": leaf_any,
+         "leaf_nopol": leaf_nopol, "root_inh": root_inh, "leaf_inh": leaf_inh,
+         "root_req": root_req, "leaf_req_ok": leaf_req_ok,
+         "leaf_req_empty": leaf_req_empty}
+    return d, objects
 
 
 def main():
@@ -371,6 +457,139 @@ def main():
     check("late evidence excluded", acct.get(late_fp, {}).get("reason") == "RECEIVED_AFTER_CUTOFF")
     check("late evidence did not change verdict",
           results["valid-cross-signed"]["verdict"] == "VALID")
+
+    # -- continuous policy mappings ----------------------------------------
+    pd, pol_objects = build_policy_dataset()
+    pcreate = post(API_A, "/v1/evidence-sets",
+                   {"request_id": f"acc-{RUN}-pol-create", "label": "policies"}, 201)
+    pset_id = json.loads(pcreate.content)["evidence_set_id"]
+    post(API_B, f"/v1/evidence-sets/{pset_id}/objects", {
+        "request_id": f"acc-{RUN}-pol-add",
+        "objects": [
+            {"type": otype, "der": base64.b64encode(der).decode(),
+             "received_at": rcv}
+            for (_name, der, otype, rcv) in pol_objects
+        ],
+    }, 200)
+    post(API_A, f"/v1/evidence-sets/{pset_id}/seal",
+         {"request_id": f"acc-{RUN}-pol-seal"}, 200)
+
+    def adjudicate_policy(name, leaf, initial, expect, anchors=None):
+        inp = adjudication_input(leaf, anchors or proot,
+                                 initial_policy_set=initial)
+        r = post(API_A, "/v1/adjudications",
+                 {"request_id": f"acc-{RUN}-pol-{name}",
+                  "evidence_set_id": pset_id, "input": inp}, 201)
+        body = json.loads(r.content)
+        check(f"policy {name}: verdict {expect}", body["verdict"] == expect,
+              f"got {body['verdict']}")
+        return body
+
+    def policy_rule(body):
+        return {r["rule"]: r for r in body["decision"]["path_rules"]}["POLICIES"]
+
+    def first_policy_failure(body):
+        for branch in body["decision"]["rejection_proof"]["branches"]:
+            if branch["failure"]["rule"] == "POLICIES":
+                return branch["failure"]
+        return None
+
+    proot = [pd["root"]]
+    body = adjudicate_policy("continuous-p1", pd["leaf_chain"], [POLICY_P1],
+                             "VALID")
+    if body["verdict"] == "VALID":
+        rule = policy_rule(body)
+        check("continuous mapping final valid set [P1]",
+              rule["valid_policies"] == [POLICY_P1], str(rule.get("valid_policies")))
+        layers = rule["policy_trace"]["certificates"]
+        # each CA keeps asserting its own policy; its mapping instead rewrites
+        # the policy expected one layer down (visible in the next layer)
+        check("continuous mapping per-layer trace",
+              [e["valid_policies_after_certificate"] for e in layers] == [
+                  [POLICY_P1], [POLICY_P2], [POLICY_P3]] and
+              layers[0]["policy_mappings"] == [[POLICY_P1, POLICY_P2]] and
+              layers[1]["policy_mappings"] == [[POLICY_P2, POLICY_P3]] and
+              all(e["mapping_permitted"] for e in layers[:-1]),
+              json.dumps(layers)[:400])
+        check("continuous mapping wrap-up", rule["policy_trace"]["wrap_up"][
+            "valid_policies"] == [POLICY_P1])
+
+    body_bad = adjudicate_policy("continuous-p4", pd["leaf_chain"],
+                                 [POLICY_P4], "INVALID")
+    if body_bad["verdict"] != "VALID":
+        failure = first_policy_failure(body_bad)
+        check("continuous mapping mismatch first rule",
+              failure is not None and failure["code"] == "POLICY_INITIAL_SET_MISMATCH",
+              str(failure)[:300])
+        check("rejected branch carries policy trace",
+              failure is not None and len(
+                  failure["policy_trace"]["certificates"]) == 3)
+
+    body3 = adjudicate_policy("three-level-p1", pd["leaf_three"],
+                              [POLICY_P1], "VALID")
+    if body3["verdict"] == "VALID":
+        check("three-level mapping final valid set [P1]",
+              policy_rule(body3)["valid_policies"] == [POLICY_P1])
+
+    body_any = adjudicate_policy("leaf-any", pd["leaf_any"], [POLICY_P1],
+                                 "VALID")
+    if body_any["verdict"] == "VALID":
+        check("anyPolicy leaf satisfies [P1]",
+              policy_rule(body_any)["valid_policies"] == [POLICY_P1])
+
+    body_empty = adjudicate_policy("empty-tree-default", pd["leaf_nopol"],
+                                   None, "VALID")
+    if body_empty["verdict"] == "VALID":
+        check("empty policy tree valid set is []",
+              policy_rule(body_empty)["valid_policies"] == [])
+    body_empty_bad = adjudicate_policy("empty-tree-specific",
+                                       pd["leaf_nopol"], [POLICY_P1], "INVALID")
+    if body_empty_bad["verdict"] != "VALID":
+        failure = first_policy_failure(body_empty_bad)
+        check("empty tree + specific initial set first rule",
+              failure is not None and
+              failure["code"] == "POLICY_INITIAL_SET_MISMATCH")
+
+    body_inh = adjudicate_policy("mapping-inhibited", pd["leaf_inh"],
+                                 [POLICY_P1], "INVALID", anchors=[pd["root_inh"]])
+    if body_inh["verdict"] != "VALID":
+        failure = first_policy_failure(body_inh)
+        check("inhibited mapping first rule",
+              failure is not None and
+              failure["code"] == "POLICY_INITIAL_SET_MISMATCH", str(failure)[:300])
+
+    body_req_ok = adjudicate_policy("explicit-required-asserted",
+                                    pd["leaf_req_ok"], [POLICY_P1], "VALID",
+                                    anchors=[pd["root_req"]])
+    if body_req_ok["verdict"] == "VALID":
+        check("explicit required with asserted policy set",
+              policy_rule(body_req_ok)["valid_policies"] == [POLICY_P1])
+    body_req_empty = adjudicate_policy("explicit-required-empty",
+                                       pd["leaf_req_empty"], [POLICY_P1],
+                                       "INVALID", anchors=[pd["root_req"]])
+    if body_req_empty["verdict"] != "VALID":
+        failure = first_policy_failure(body_req_empty)
+        check("explicit required + empty tree first rule",
+              failure is not None and failure["code"] == "POLICY_TREE_EMPTY",
+              str(failure)[:300])
+
+    # the continuous-mapping pack must recompute offline to the same result
+    pol_adj = body["adjudication_id"]
+    pol_pack = requests.get(f"{API_A}/v1/adjudications/{pol_adj}/evidence-pack",
+                            timeout=120)
+    check("policy pack download", pol_pack.status_code == 200)
+    with tempfile.NamedTemporaryFile("wb", suffix=".json", delete=False) as fh:
+        fh.write(pol_pack.content)
+        ppath = fh.name
+    proc = subprocess.run([sys.executable, "-m", "app.verify", ppath],
+                          capture_output=True, text=True,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    check("policy pack offline recomputation", proc.returncode == 0,
+          proc.stdout[-500:] + proc.stderr[-500:])
+    pack_obj = json.loads(pol_pack.content)
+    check("policy pack records per-layer state",
+          all("policy_trace" in r for r in pack_obj["result"]["decision"]["path_rules"]
+              if r["rule"] == "POLICIES"))
 
     # -- evidence pack + offline verification --------------------------------
     adj_id = results["valid-cross-signed"]["adjudication_id"]

@@ -219,8 +219,11 @@ class Explorer:
                          nc["code"], nc.get("detail"))
         pol = evaluate_policies(path, self._initial_policy_set)
         if pol["result"] != "pass":
-            return _fail(pol.get("certificate", path_fps[0]), R_POLICIES,
-                         pol["code"], pol.get("detail"))
+            failure = _fail(pol.get("certificate", path_fps[0]), R_POLICIES,
+                            pol["code"], pol.get("detail"))
+            if pol.get("policy_trace") is not None:
+                failure["policy_trace"] = pol["policy_trace"]
+            return failure
         return None
 
     # ------------------------------------------------------------------
